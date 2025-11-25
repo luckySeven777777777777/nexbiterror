@@ -1,106 +1,108 @@
-// ==========================
-//      NEXBIT 服务版 SERVER
-// ==========================
+//--------------------------------------------------
+// server.js — Railway 可运行 + 静态页面 + 双机器人
+//--------------------------------------------------
 
 const express = require("express");
-const session = require("express-session");
 const path = require("path");
 const fs = require("fs");
-const bodyParser = require("body-parser");
 const cors = require("cors");
 
-// 环境变量
-require("dotenv").config();
-
+// =======================
+//  初始化 Express
+// =======================
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// ==========================
-//      MIDDLEWARE
-// ==========================
 app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// session
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || "nexbit_default_secret",
-    resave: false,
-    saveUninitialized: true,
-  })
-);
+// =======================
+//  静态文件：public 目录
+// =======================
+const PUBLIC_DIR = path.join(__dirname, "public");
+app.use(express.static(PUBLIC_DIR));
 
-// ==========================
-//      静态资源
-// ==========================
-app.use("/public", express.static(path.join(__dirname, "public")));
-app.use("/assets", express.static(path.join(__dirname, "public/assets")));
+// 让所有 HTML 都能直接访问
+app.get("/", (req, res) => {
+    res.sendFile(path.join(PUBLIC_DIR, "login.html"));
+});
 
-// ==========================
-//      登录验证
-// ==========================
-function requireLogin(req, res, next) {
-  if (!req.session.loggedIn) return res.redirect("/login");
-  next();
+// =======================
+//   载入数据库 JSON
+// =======================
+const DB_FILE = path.join(__dirname, "database.json");
+function loadDB() {
+    try {
+        return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    } catch (e) {
+        console.log("⚠ database.json 读取失败，已使用空对象");
+        return {};
+    }
+}
+function saveDB(data) {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-// ==========================
-//      页面路由
-// ==========================
+// =======================
+//   API 示例（自行替换）
+// =======================
+app.post("/api/login", (req, res) => {
+    const { username, password } = req.body;
+    const db = loadDB();
+    if (!db.users) return res.status(400).json({ ok: false });
 
-// 登录页
-app.get("/login", (req, res) => {
-  res.sendFile(path.join(__dirname, "public/login.html"));
+    const user = db.users.find(
+        u => u.username === username && u.password === password
+    );
+
+    if (user) return res.json({ ok: true });
+    else return res.status(401).json({ ok: false });
 });
 
-// 登录提交
-app.post("/login", (req, res) => {
-  const { username, password } = req.body;
+// ===============================================================
+//  两个 Telegram Bot 同时运行（AdminBot + MarketBot）
+// ===============================================================
+const TelegramBot = require("node-telegram-bot-api");
 
-  const admin = JSON.parse(fs.readFileSync("database.json"));
+// 从 Railway 环境变量中取（推荐）
+// 在 Railway → Variables 设置： ADMIN_BOT_TOKEN / MARKET_BOT_TOKEN
+const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN || "YOUR_ADMIN_BOT_TOKEN";
+const MARKET_BOT_TOKEN = process.env.MARKET_BOT_TOKEN || "YOUR_MARKET_BOT_TOKEN";
 
-  if (username === admin.username && password === admin.password) {
-    req.session.loggedIn = true;
-    return res.redirect("/admin");
-  }
+console.log("🤖 准备启动 Telegram Bot...");
 
-  res.send("<h3>登录失败，账号或密码错误</h3>");
-});
+// ---- Admin Bot -------------------------------------------------
+let adminBot = null;
+if (ADMIN_BOT_TOKEN && ADMIN_BOT_TOKEN !== "YOUR_ADMIN_BOT_TOKEN") {
+    adminBot = new TelegramBot(ADMIN_BOT_TOKEN, { polling: true });
 
-// 管理后台首页
-app.get("/admin", requireLogin, (req, res) => {
-  res.sendFile(path.join(__dirname, "public/admins.html"));
-});
+    adminBot.on("message", (msg) => {
+        adminBot.sendMessage(msg.chat.id, "AdminBot 正常运行中");
+    });
 
-// 其它页面
-app.get("/dashboard", requireLogin, (req, res) => {
-  res.sendFile(path.join(__dirname, "public/dashboard-brand.html"));
-});
+    console.log("✔ AdminBot 已启动");
+} else {
+    console.log("⚠ 未设置 ADMIN_BOT_TOKEN，AdminBot 未启动");
+}
 
-app.get("/admin-new", requireLogin, (req, res) => {
-  res.sendFile(path.join(__dirname, "public/admin-new.html"));
-});
+// ---- Market Bot ------------------------------------------------
+let marketBot = null;
+if (MARKET_BOT_TOKEN && MARKET_BOT_TOKEN !== "YOUR_MARKET_BOT_TOKEN") {
+    marketBot = new TelegramBot(MARKET_BOT_TOKEN, { polling: true });
 
-// ==========================
-//      API 示例
-// ==========================
+    marketBot.on("message", (msg) => {
+        marketBot.sendMessage(msg.chat.id, "MarketBot 正常运行中");
+    });
 
-app.get("/api/user", requireLogin, (req, res) => {
-  const admin = JSON.parse(fs.readFileSync("database.json"));
-  res.json({ username: admin.username });
-});
+    console.log("✔ MarketBot 已启动");
+} else {
+    console.log("⚠ 未设置 MARKET_BOT_TOKEN，MarketBot 未启动");
+}
 
-// ==========================
-//      ROOT → 自动跳转 login
-// ==========================
-app.get("/", (req, res) => {
-  res.redirect("/login");
-});
-
-// ==========================
-//      启动服务器
-// ==========================
+// =======================
+//  Railway 的端口支持
+// =======================
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Nexbit service running on port:", PORT);
+    console.log(`🚀 Server is running on port ${PORT}`);
+    console.log(`🌐 http://localhost:${PORT}`);
 });
