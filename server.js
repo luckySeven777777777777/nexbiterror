@@ -1,140 +1,106 @@
+// ==========================
+//      NEXBIT 服务版 SERVER
+// ==========================
+
 const express = require("express");
 const session = require("express-session");
 const path = require("path");
-const bodyParser = require("body-parser");
 const fs = require("fs");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+
+// 环境变量
+require("dotenv").config();
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// =====================
-// 1. STATIC FILE CONFIG
-// =====================
-const publicPath = path.join(__dirname, "public");
-app.use(express.static(publicPath));   // 静态文件目录
-
-// 默认首页跳转到 login.html
-app.get("/", (req, res) => {
-    res.sendFile(path.join(publicPath, "login.html"));
-});
-
-// =====================
-// 2. SESSION CONFIG
-// =====================
-app.use(
-    session({
-        secret: process.env.SESSION_SECRET || "nexbit_secret",
-        resave: false,
-        saveUninitialized: true,
-        cookie: {
-            maxAge: 86400000
-        }
-    })
-);
-
-// =====================
-// 3. JSON + FORM PARSER
-// =====================
+// ==========================
+//      MIDDLEWARE
+// ==========================
+app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// =====================
-// 4. AUTH MIDDLEWARE
-// =====================
+// session
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "nexbit_default_secret",
+    resave: false,
+    saveUninitialized: true,
+  })
+);
 
-// 登录保护
-function requireAdmin(req, res, next) {
-    if (!req.session || !req.session.admin) {
-        return res.redirect("/login.html");
-    }
-    next();
+// ==========================
+//      静态资源
+// ==========================
+app.use("/public", express.static(path.join(__dirname, "public")));
+app.use("/assets", express.static(path.join(__dirname, "public/assets")));
+
+// ==========================
+//      登录验证
+// ==========================
+function requireLogin(req, res, next) {
+  if (!req.session.loggedIn) return res.redirect("/login");
+  next();
 }
 
-// =====================
-// 5. LOAD DATABASE JSON
-// =====================
+// ==========================
+//      页面路由
+// ==========================
 
-const dbPath = path.join(__dirname, "database.json");
-function loadDB() {
-    return JSON.parse(fs.readFileSync(dbPath, "utf8"));
-}
-function saveDB(data) {
-    fs.writeFileSync(dbPath, JSON.stringify(data, null, 2));
-}
-
-// =====================
-// 6. LOGIN API
-// =====================
-
-app.post("/api/login", (req, res) => {
-    const { username, password } = req.body;
-
-    const db = loadDB();
-    const admin = db.admins.find(a => a.username === username && a.password === password);
-
-    if (!admin) return res.json({ success: false, message: "账号或密码错误" });
-
-    req.session.admin = admin.username;
-
-    res.json({ success: true });
+// 登录页
+app.get("/login", (req, res) => {
+  res.sendFile(path.join(__dirname, "public/login.html"));
 });
 
-// =====================
-// 7. PROTECTED PAGES
-// =====================
+// 登录提交
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
 
-app.get("/admin-new.html", requireAdmin, (req, res) => {
-    res.sendFile(path.join(publicPath, "admin-new.html"));
+  const admin = JSON.parse(fs.readFileSync("database.json"));
+
+  if (username === admin.username && password === admin.password) {
+    req.session.loggedIn = true;
+    return res.redirect("/admin");
+  }
+
+  res.send("<h3>登录失败，账号或密码错误</h3>");
 });
 
-app.get("/admins.html", requireAdmin, (req, res) => {
-    res.sendFile(path.join(publicPath, "admins.html"));
+// 管理后台首页
+app.get("/admin", requireLogin, (req, res) => {
+  res.sendFile(path.join(__dirname, "public/admins.html"));
 });
 
-app.get("/dashboard-brand.html", requireAdmin, (req, res) => {
-    res.sendFile(path.join(publicPath, "dashboard-brand.html"));
+// 其它页面
+app.get("/dashboard", requireLogin, (req, res) => {
+  res.sendFile(path.join(__dirname, "public/dashboard-brand.html"));
 });
 
-// =====================
-// 8. TELEGRAM BOTS FIX
-// =====================
+app.get("/admin-new", requireLogin, (req, res) => {
+  res.sendFile(path.join(__dirname, "public/admin-new.html"));
+});
 
-// 解决 409 错误：强制设定 long polling 单实例
-const { Telegraf } = require("telegraf");
+// ==========================
+//      API 示例
+// ==========================
 
-// Market Bot
-if (process.env.BOT_TOKEN) {
-    const MarketBot = new Telegraf(process.env.BOT_TOKEN);
-    MarketBot.launch({
-        polling: {
-            timeout: 60,
-            interval: 500
-        }
-    }).then(() => {
-        console.log("[MarketBot] 已启动");
-    }).catch(err => {
-        console.log("[MarketBot 启动错误] ", err.message);
-    });
-}
+app.get("/api/user", requireLogin, (req, res) => {
+  const admin = JSON.parse(fs.readFileSync("database.json"));
+  res.json({ username: admin.username });
+});
 
-// Admin Bot
-if (process.env.ADMIN_BOT_TOKEN) {
-    const AdminBot = new Telegraf(process.env.ADMIN_BOT_TOKEN);
-    AdminBot.launch({
-        polling: {
-            timeout: 60,
-            interval: 500
-        }
-    }).then(() => {
-        console.log("[AdminBot] 已启动");
-    }).catch(err => {
-        console.log("[AdminBot 启动错误] ", err.message);
-    });
-}
+// ==========================
+//      ROOT → 自动跳转 login
+// ==========================
+app.get("/", (req, res) => {
+  res.redirect("/login");
+});
 
-// =====================
-// 9. START SERVER
-// =====================
-const PORT = process.env.PORT || 3000;
+// ==========================
+//      启动服务器
+// ==========================
 app.listen(PORT, () => {
-    console.log(`Nexbit 后台运行在端口: ${PORT}`);
+  console.log("Nexbit service running on port:", PORT);
 });
