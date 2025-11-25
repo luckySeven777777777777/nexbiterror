@@ -1,86 +1,210 @@
-// server.js - Nexbit full API with SQLite + dual Telegram bots (market + admin)
-// Save to project root as server.js
-// Install deps: npm install express sqlite3 bcrypt express-session uuid node-telegram-bot-api
+/**
+ * server.js - Nexbit minimal full backend (SQLite + Telegram bots)
+ *
+ * Requirements:
+ *   npm i express sqlite3 bcrypt express-session uuid node-telegram-bot-api
+ *
+ * How it works (summary):
+ * - Reads database.json if present (or uses env vars)
+ * - Initializes SQLite database with tables if not exist
+ * - Serves static files from ./public
+ * - Provides /api/* endpoints: /api/login, /api/logout, /api/me, /api/admins, /api/users, /api/adjust, /api/request-2fa
+ * - Creates two Telegram bots (marketBot, adminBot) when tokens available
+ * - Periodic monitor looks for pending deposits/withdrawals and notifies adminBot on failure / suspicious behavior
+ */
 
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const session = require('express-session');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
+const session = require('express-session');
 const { v4: uuidv4 } = require('uuid');
 const TelegramBot = require('node-telegram-bot-api');
 
-// --------- Load config (database.json optional) ----------
-let cfg = {};
-const cfgPath = path.join(__dirname, 'database.json');
-if (fs.existsSync(cfgPath)) {
-  try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8') || '{}'); }
-  catch (e) { console.warn('Invalid database.json, ignoring', e && e.message); cfg = {}; }
-}
-const PORT = process.env.PORT || cfg.port || 3006;
-const SESSION_SECRET = process.env.SESSION_SECRET || cfg.sessionSecret || 'nexbit_session_secret_change_me';
-
-// Bot tokens: Bot A = market push (existing), Bot B = admin notifications (new)
-const BOT_A_TOKEN = process.env.BOT_A_TOKEN || process.env.BOT_TOKEN || cfg.botA || cfg.marketBotToken || cfg.telegramBotToken || '';
-const BOT_B_TOKEN = process.env.ADMIN_BOT_TOKEN || process.env.BOT_B_TOKEN || cfg.botB || cfg.adminBotToken || '';
-// admin chat id(s) - string or comma separated
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || process.env.TELEGRAM_ADMIN_CHAT_ID || cfg.telegramAdminChatId || cfg.adminChatId || '';
-
-// --------- Init Telegram bots (send only, no polling) ----------
-let marketBot = null;
-let adminBot = null;
-if (BOT_A_TOKEN && BOT_A_TOKEN.indexOf('PUT_') === -1) {
-  try {
-    marketBot = new TelegramBot(BOT_A_TOKEN, { polling: false });
-    console.log('[bot] Market push bot ready');
-  } catch (e) { console.warn('[bot] market bot init failed', e && e.message); marketBot = null; }
-} else {
-  console.log('[bot] Market bot not configured (BOT_A_TOKEN)');
-}
-if (BOT_B_TOKEN && BOT_B_TOKEN.indexOf('PUT_') === -1) {
-  try {
-    adminBot = new TelegramBot(BOT_B_TOKEN, { polling: false });
-    console.log('[bot] Admin bot ready');
-  } catch (e) { console.warn('[bot] admin bot init failed', e && e.message); adminBot = null; }
-} else {
-  console.log('[bot] Admin bot not configured (ADMIN_BOT_TOKEN)');
+// ---------- read config from database.json or env ----------
+const configPath = path.join(__dirname, 'database.json');
+let fileConfig = {};
+try {
+  if (fs.existsSync(configPath)) {
+    fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  }
+} catch (err) {
+  console.warn('Invalid database.json, ignoring or use env variables', err.message);
 }
 
-// Helper senders
-async function sendMarketPush(text) {
-  if (!marketBot) return;
-  try {
-    if (!ADMIN_CHAT_ID) return;
-    // allow comma separated chat ids
-    for (const id of (ADMIN_CHAT_ID || '').toString().split(',').map(x=>x.trim()).filter(Boolean)) {
-      await marketBot.sendMessage(id, text);
-    }
-  } catch (e) { console.warn('market push failed', e && e.message); }
-}
-async function sendAdminNotify(text) {
-  if (!adminBot) return;
-  try {
-    for (const id of (ADMIN_CHAT_ID || '').toString().split(',').map(x=>x.trim()).filter(Boolean)) {
-      await adminBot.sendMessage(id, text);
-    }
-  } catch (e) { console.warn('admin notify failed', e && e.message); }
-}
-async function sendAdminNotifyTo(chatId, text) {
-  if (!adminBot) return;
-  try { await adminBot.sendMessage(chatId, text); } catch (e) { console.warn('admin notify failed', e && e.message); }
-}
+const PORT = process.env.PORT || fileConfig.port || 3006;
+const SESSION_SECRET = process.env.SESSION_SECRET || fileConfig.sessionSecret || 'nexbit_session_secret_default';
+const BOT_A_TOKEN = process.env.BOT_TOKEN || fileConfig.telegramBotToken || ''; // market push bot
+const BOT_B_TOKEN = process.env.ADMIN_BOT_TOKEN || fileConfig.adminBotToken || ''; // admin notification bot
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || fileConfig.telegramAdminChatId || (fileConfig.telegramChatId || '');
 
-// --------- App & DB ----------
-const app = express();
+// ---------- ensure data dir and sqlite file ----------
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-const DB_PATH = path.join(DATA_DIR, 'nexbit.sqlite3');
+const DB_FILE = path.join(__dirname, 'nexbit.sqlite3');
 
+// ---------- init sqlite database ----------
+const db = new sqlite3.Database(DB_FILE);
+
+function initDb() {
+  // admins (for backend login)
+  db.run(`CREATE TABLE IF NOT EXISTS admins (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE,
+    password TEXT,
+    email TEXT,
+    isSuper INTEGER DEFAULT 0,
+    twoFAEnabled INTEGER DEFAULT 0,
+    twoFASecret TEXT,
+    twoFACode TEXT,
+    twoFAExpires INTEGER
+  )`);
+
+  // members (users)
+  db.run(`CREATE TABLE IF NOT EXISTS members (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE,
+    email TEXT,
+    balance REAL DEFAULT 0,
+    agent_id TEXT,
+    created_at INTEGER
+  )`);
+
+  // transactions (generic record)
+  db.run(`CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    member_id TEXT,
+    kind TEXT, -- deposit/withdraw/adjust
+    amount REAL,
+    status TEXT,
+    note TEXT,
+    created_at INTEGER
+  )`);
+
+  // deposits
+  db.run(`CREATE TABLE IF NOT EXISTS deposits (
+    id TEXT PRIMARY KEY,
+    member_id TEXT,
+    amount REAL,
+    status TEXT,
+    created_at INTEGER
+  )`);
+
+  // withdrawals
+  db.run(`CREATE TABLE IF NOT EXISTS withdrawals (
+    id TEXT PRIMARY KEY,
+    member_id TEXT,
+    amount REAL,
+    status TEXT,
+    created_at INTEGER
+  )`);
+
+  // agents
+  db.run(`CREATE TABLE IF NOT EXISTS agents (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    commission REAL DEFAULT 0
+  )`);
+
+  // logs
+  db.run(`CREATE TABLE IF NOT EXISTS logs (
+    id TEXT PRIMARY KEY,
+    level TEXT,
+    message TEXT,
+    meta TEXT,
+    created_at INTEGER
+  )`);
+
+  // settings
+  db.run(`CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )`);
+
+  // ensure default admin exists
+  db.get(`SELECT COUNT(*) AS c FROM admins`, (err, row) => {
+    if (err) {
+      console.error('db select admins error', err);
+      return;
+    }
+    if (row && row.c === 0) {
+      const defaultPassword = '444721';
+      bcrypt.hash(defaultPassword, 10).then(hash => {
+        const id = uuidv4();
+        db.run(`INSERT INTO admins (id, username, password, email, isSuper) VALUES (?, ?, ?, ?, ?)`,
+          [id, 'admin', hash, 'admin@example.com', 1], err2 => {
+            if (err2) console.error('insert default admin err', err2);
+            else console.log('Created default admin: admin / 444721');
+          });
+      });
+    }
+  });
+}
+
+initDb();
+
+// ---------- Telegram bots init ----------
+let marketBot = null;
+let adminBot = null;
+
+function safeCreateBot(token, name) {
+  if (!token) {
+    console.warn(`${name} token not configured`);
+    return null;
+  }
+  try {
+    const bot = new TelegramBot(token, { polling: true });
+    bot.on('polling_error', (err) => {
+      console.error(`${name} polling_error`, err && err.code ? { code: err.code, message: err.message } : err);
+    });
+    bot.on('message', (msg) => {
+      // basic handling: log incoming messages to DB
+      console.log(`[${name}] incoming from ${msg.chat.id}: ${msg.text}`);
+    });
+    console.log(`${name} started`);
+    return bot;
+  } catch (e) {
+    console.error(`Failed to start ${name}`, e.message || e);
+    return null;
+  }
+}
+
+marketBot = safeCreateBot(BOT_A_TOKEN, 'MarketBot');
+adminBot = safeCreateBot(BOT_B_TOKEN, 'AdminBot');
+
+// helper to notify admin
+function notifyAdmin(text, options = {}) {
+  const chatId = ADMIN_CHAT_ID || fileConfig.telegramAdminChatId;
+  if (!adminBot || !chatId) {
+    console.warn('Admin bot or chat id not configured, skip notify:', text);
+    return;
+  }
+  try {
+    adminBot.sendMessage(chatId.toString(), text, options).catch(e => {
+      console.error('adminBot sendMessage error', e.message || e);
+    });
+  } catch (e) {
+    console.error('notifyAdmin error', e);
+  }
+}
+
+// helper: market push
+function marketPush(text) {
+  if (!marketBot) return;
+  const chatId = fileConfig.marketPushChatId || fileConfig.MARKET_PUSH_CHAT_ID || ADMIN_CHAT_ID;
+  if (!chatId) return;
+  marketBot.sendMessage(chatId.toString(), text).catch(e => {
+    console.error('marketBot send error', e.message || e);
+  });
+}
+
+// ---------- Express app ----------
+const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// serve static public (important!)
+// static front-end (public)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // session
@@ -91,355 +215,257 @@ app.use(session({
   cookie: { maxAge: 24 * 3600 * 1000 }
 }));
 
-// sqlite helpers
-const db = new sqlite3.Database(DB_PATH);
-function run(sql, params) { return new Promise((res, rej) => db.run(sql, params || [], function (err) { if (err) rej(err); else res(this); })); }
-function all(sql, params) { return new Promise((res, rej) => db.all(sql, params || [], (e, r) => e ? rej(e) : res(r))); }
-function get(sql, params) { return new Promise((res, rej) => db.get(sql, params || [], (e, r) => e ? rej(e) : res(r))); }
-
-// init schema
-async function initDB(){
-  await run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT,
-    role TEXT,
-    email TEXT,
-    is_super INTEGER DEFAULT 0,
-    twofa_enabled INTEGER DEFAULT 0,
-    twofa_secret TEXT,
-    created_at TEXT
-  )`);
-  await run(`CREATE TABLE IF NOT EXISTS members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    wallet TEXT,
-    agent_of INTEGER,
-    balance REAL DEFAULT 0,
-    level TEXT,
-    last_activity TEXT,
-    created_at TEXT
-  )`);
-  await run(`CREATE TABLE IF NOT EXISTS deposits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT,
-    member_id INTEGER,
-    wallet TEXT,
-    amount REAL,
-    currency TEXT,
-    status TEXT,
-    ip TEXT,
-    timestamp TEXT,
-    raw TEXT
-  )`);
-  await run(`CREATE TABLE IF NOT EXISTS withdrawals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT,
-    member_id INTEGER,
-    wallet TEXT,
-    amount REAL,
-    currency TEXT,
-    status TEXT,
-    ip TEXT,
-    timestamp TEXT,
-    raw TEXT
-  )`);
-  await run(`CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT,
-    user TEXT,
-    amount REAL,
-    status TEXT,
-    timestamp TEXT,
-    raw TEXT
-  )`);
-  await run(`CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)`);
-  // default super admin if no users
-  const cnt = await get('SELECT COUNT(*) as c FROM users');
-  if (cnt && cnt.c === 0) {
-    const hash = await bcrypt.hash('444721', 10);
-    await run('INSERT INTO users (username, password, role, is_super, created_at) VALUES (?,?,?,?,?)',
-      ['admin', hash, 'admin', 1, new Date().toISOString()]);
-    console.log('Default super admin created: admin / 444721');
-  }
-}
-initDB().catch(e=>console.error('DB init error', e && e.message));
-
-// ---------- AUTH middleware ----------
+// simple auth middleware
 function requireAuth(req, res, next) {
-  if (req.session && req.session.user && req.session.user.id) return next();
-  return res.status(401).json({ ok:false, message:'请先登录' });
-}
-function requireSuper(req, res, next) {
-  if (req.session && req.session.user && req.session.user.is_super) return next();
-  return res.status(403).json({ ok:false, message:'需要超级管理员权限' });
+  if (req.session && req.session.admin && req.session.admin.id) return next();
+  res.status(401).json({ error: 'unauthorized' });
 }
 
-// ---------- API: auth ----------
-app.post('/api/login', async (req, res) => {
-  try {
-    const { username, password, twofa } = req.body || {};
-    if (!username || !password) return res.json({ ok:false, message:'缺少用户名或密码' });
-    const u = await get('SELECT id, username, password, role, is_super, twofa_enabled, twofa_secret FROM users WHERE username=?', [username]);
-    if (!u) return res.json({ ok:false, message:'账号或密码错误' });
-    const match = await bcrypt.compare(String(password), u.password);
-    if (!match) return res.json({ ok:false, message:'账号或密码错误' });
-    // check 2fa if enabled (simple placeholder: compare provided code with stored secret)
-    if (u.twofa_enabled) {
-      if (!twofa || twofa !== u.twofa_secret) return res.json({ ok:false, message:'2FA 验证失败' });
-    }
-    req.session.user = { id: u.id, username: u.username, role: u.role, is_super: u.is_super ? 1 : 0 };
-    req.session.token = uuidv4();
-    // notify via admin bot
-    try { await sendAdminNotify(`🔐 管理员登录: ${u.username}\nIP: ${req.ip}\n时间: ${new Date().toLocaleString()}`); } catch(e){ console.warn('sendLoginNotify failed', e && e.message) }
-    return res.json({ ok:true, user: req.session.user, token: req.session.token });
-  } catch (e) { console.error(e); return res.status(500).json({ ok:false, message:'服务器错误' }); }
+// ---------- API endpoints ----------
+
+// login: body { username, password, twofa (optional) }
+app.post('/api/login', (req, res) => {
+  const { username, password, twofa } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'missing fields' });
+
+  db.get(`SELECT * FROM admins WHERE username = ?`, [username], (err, admin) => {
+    if (err) return res.status(500).json({ error: 'db error' });
+    if (!admin) return res.status(401).json({ error: 'invalid credentials' });
+
+    bcrypt.compare(password, admin.password).then(match => {
+      if (!match) return res.status(401).json({ error: 'invalid credentials' });
+
+      // if twoFAEnabled require code validation
+      if (admin.twoFAEnabled) {
+        if (!twofa) return res.status(403).json({ error: '2fa_required' });
+        // check code and expiry
+        if (!admin.twoFACode || !admin.twoFAExpires || Date.now() > admin.twoFAExpires) {
+          return res.status(403).json({ error: '2fa_expired_or_not_sent' });
+        }
+        if (twofa !== admin.twoFACode) {
+          return res.status(403).json({ error: '2fa_invalid' });
+        }
+      }
+
+      // success -> set session
+      req.session.admin = {
+        id: admin.id,
+        username: admin.username,
+        email: admin.email,
+        isSuper: !!admin.isSuper
+      };
+      // clear twoFACode after used
+      db.run(`UPDATE admins SET twoFACode = NULL, twoFAExpires = NULL WHERE id = ?`, [admin.id]);
+      res.json({ ok: true, admin: req.session.admin });
+      notifyAdmin(`管理员 ${admin.username} 已登录（${new Date().toLocaleString()}）`);
+    }).catch(err2 => {
+      console.error('bcrypt compare err', err2);
+      res.status(500).json({ error: 'internal' });
+    });
+  });
 });
 
-app.post('/api/logout', (req, res) => {
-  if (req.session) req.session.destroy(()=>res.json({ ok:true }));
-  else res.json({ ok:true });
+// request 2FA: generate code and send to admin via adminBot
+// body: { username } - admin username requests 2fa
+app.post('/api/request-2fa', (req, res) => {
+  const { username } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'missing username' });
+  db.get(`SELECT * FROM admins WHERE username = ?`, [username], (err, admin) => {
+    if (err || !admin) return res.status(404).json({ error: 'admin not found' });
+
+    const code = (Math.floor(100000 + Math.random() * 900000)).toString(); // 6-digit
+    const expireAt = Date.now() + (5 * 60 * 1000); // 5 minutes
+    db.run(`UPDATE admins SET twoFACode = ?, twoFAExpires = ? WHERE id = ?`, [code, expireAt, admin.id], (uerr) => {
+      if (uerr) return res.status(500).json({ error: 'db' });
+      // send via adminBot
+      const chatId = ADMIN_CHAT_ID || fileConfig.telegramAdminChatId;
+      if (adminBot && chatId) {
+        adminBot.sendMessage(chatId.toString(), `你的后台一次性验证码：${code}（有效期 5 分钟）`).catch(e => {
+          console.error('adminBot send 2fa err', e);
+        });
+      } else {
+        console.warn('adminBot not configured to send 2fa');
+      }
+      res.json({ ok: true, message: '2fa_sent' });
+    });
+  });
 });
+
+// logout
+app.post('/api/logout', requireAuth, (req, res) => {
+  req.session.destroy(() => {
+    res.json({ ok: true });
+  });
+});
+
+// me
 app.get('/api/me', (req, res) => {
-  if (req.session && req.session.user) return res.json({ ok:true, user: req.session.user });
-  return res.status(401).json({ ok:false });
+  if (!req.session || !req.session.admin) return res.json({ admin: null });
+  res.json({ admin: req.session.admin });
 });
 
-// ---------- Admin users ----------
-app.get('/api/admins/list', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const rows = await all('SELECT id, username, role, email, is_super, created_at, twofa_enabled FROM users ORDER BY id DESC');
-    res.json({ ok:true, users: rows });
-  } catch (e) { res.status(500).json({ ok:false, message: e.message }); }
+// Admin list (require auth)
+app.get('/api/admins', requireAuth, (req, res) => {
+  db.all(`SELECT id, username, email, isSuper, twoFAEnabled FROM admins`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'db' });
+    res.json({ admins: rows });
+  });
 });
 
-app.post('/api/admins/add', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const { username, password, role='admin', email, is_super=0 } = req.body || {};
-    if (!username || !password) return res.status(400).json({ ok:false, message:'缺少参数' });
-    const hash = await bcrypt.hash(String(password), 10);
-    await run('INSERT INTO users (username,password,role,email,is_super,created_at) VALUES (?,?,?,?,?,?)', [username, hash, role, email||null, is_super?1:0, new Date().toISOString()]);
-    try { await sendAdminNotify(`🧑‍💼 新管理员已创建: ${username} (by ${req.session.user.username})`); } catch(e){}
-    res.json({ ok:true });
-  } catch (e) {
-    if (e && e.message && e.message.indexOf('UNIQUE')!==-1) return res.json({ ok:false, message:'用户名已存在' });
-    res.status(500).json({ ok:false, message: e.message });
+// Users (members)
+app.get('/api/members', requireAuth, (req, res) => {
+  db.all(`SELECT * FROM members ORDER BY created_at DESC LIMIT 200`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'db' });
+    res.json({ members: rows });
+  });
+});
+
+// create/update member
+app.post('/api/members', requireAuth, (req, res) => {
+  const m = req.body;
+  if (!m || !m.username) return res.status(400).json({ error: 'missing username' });
+  const id = m.id || uuidv4();
+  const now = Date.now();
+  if (m.id) {
+    db.run(`UPDATE members SET username = ?, email = ?, balance = ?, agent_id = ? WHERE id = ?`,
+      [m.username, m.email || '', m.balance || 0, m.agent_id || null, id], (err) => {
+        if (err) return res.status(500).json({ error: 'db' });
+        res.json({ ok: true, id });
+      });
+  } else {
+    db.run(`INSERT INTO members (id, username, email, balance, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, m.username, m.email || '', m.balance || 0, m.agent_id || null, now], (err) => {
+        if (err) return res.status(500).json({ error: 'db' });
+        res.json({ ok: true, id });
+      });
   }
 });
 
-app.post('/api/admins/delete', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const { id } = req.body || {};
-    if (!id) return res.status(400).json({ ok:false });
-    await run('DELETE FROM users WHERE id=?', [Number(id)]);
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message: e.message }); }
+// adjust amount (credit/debit) - body { member_id, amount, reason }
+app.post('/api/adjust', requireAuth, (req, res) => {
+  const { member_id, amount, reason } = req.body || {};
+  if (!member_id || typeof amount !== 'number') return res.status(400).json({ error: 'missing' });
+
+  db.get(`SELECT * FROM members WHERE id = ?`, [member_id], (err, mem) => {
+    if (err || !mem) return res.status(404).json({ error: 'member not found' });
+    const newBalance = (mem.balance || 0) + amount;
+    db.run(`UPDATE members SET balance = ? WHERE id = ?`, [newBalance, member_id], (uerr) => {
+      if (uerr) return res.status(500).json({ error: 'db' });
+      const txId = uuidv4();
+      const now = Date.now();
+      db.run(`INSERT INTO transactions (id, member_id, kind, amount, status, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [txId, member_id, 'adjust', amount, 'done', reason || '', now]);
+      // notify admin via adminBot
+      notifyAdmin(`余额调整: 会员 ${mem.username} (${member_id}) 改变 ${amount >= 0 ? '+' : ''}${amount}，新余额 ${newBalance}。原因: ${reason || '无'}`);
+      res.json({ ok: true, newBalance });
+    });
+  });
 });
 
-app.post('/api/admins/changepwd', requireAuth, async (req, res) => {
-  try {
-    const { oldPassword, newPassword } = req.body || {};
-    if (!oldPassword || !newPassword) return res.status(400).json({ ok:false });
-    const u = await get('SELECT id, password FROM users WHERE id=?', [req.session.user.id]);
-    const match = await bcrypt.compare(String(oldPassword), u.password);
-    if (!match) return res.json({ ok:false, message:'旧密码错误' });
-    const hash = await bcrypt.hash(String(newPassword), 10);
-    await run('UPDATE users SET password=? WHERE id=?', [hash, req.session.user.id]);
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message: e.message }); }
+// admin actions: force withdrawal mark failed / success (for testing)
+app.post('/api/withdrawals/:id/mark', requireAuth, (req, res) => {
+  const id = req.params.id;
+  const { status } = req.body;
+  if (!id || !status) return res.status(400).json({ error: 'missing fields' });
+  db.run(`UPDATE withdrawals SET status = ? WHERE id = ?`, [status, id], (err) => {
+    if (err) return res.status(500).json({ error: 'db' });
+    // notify admin
+    notifyAdmin(`提款 ${id} 状态已被管理员设置为 ${status}`);
+    res.json({ ok: true });
+  });
 });
 
-// ---------- Members ----------
-app.get('/api/members', requireAuth, async (req, res) => {
-  try {
-    const rows = await all('SELECT id, name, wallet, agent_of, balance, level, last_activity, created_at FROM members ORDER BY id DESC LIMIT 1000');
-    res.json({ ok:true, members: rows });
-  } catch (e) { res.status(500).json({ ok:false, message: e.message }); }
+// simple endpoint for creating fake deposit/withdraw for testing
+app.post('/api/test-deposit', requireAuth, (req, res) => {
+  const { member_id, amount } = req.body || {};
+  if (!member_id || typeof amount !== 'number') return res.status(400).json({ error: 'missing' });
+  const id = uuidv4();
+  const now = Date.now();
+  db.run(`INSERT INTO deposits (id, member_id, amount, status, created_at) VALUES (?, ?, ?, ?, ?)`,
+    [id, member_id, amount, 'pending', now], (err) => {
+      if (err) return res.status(500).json({ error: 'db' });
+      res.json({ ok: true, id });
+    });
 });
 
-app.post('/api/members/add', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const { name, wallet, agent_of } = req.body || {};
-    await run('INSERT INTO members (name,wallet,agent_of,created_at) VALUES (?,?,?,?)', [name||null, wallet||null, agent_of||null, new Date().toISOString()]);
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
+// debug route to list deposits/withdrawals
+app.get('/api/monitor', requireAuth, (req, res) => {
+  db.all(`SELECT * FROM deposits ORDER BY created_at DESC LIMIT 50`, [], (err, depRows) => {
+    if (err) depRows = [];
+    db.all(`SELECT * FROM withdrawals ORDER BY created_at DESC LIMIT 50`, [], (err2, wRows) => {
+      if (err2) wRows = [];
+      res.json({ deposits: depRows, withdrawals: wRows });
+    });
+  });
 });
 
-// ---------- Deposits/Withdrawals/Orders ----------
-app.get('/proxy/deposits', requireAuth, async (req, res) => {
-  try {
-    const rows = await all('SELECT d.*, m.name as member_name FROM deposits d LEFT JOIN members m ON m.id=d.member_id ORDER BY timestamp DESC LIMIT 2000');
-    res.json(rows);
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, message:e.message }); }
-});
+// ---------- Monitoring logic (polling deposit/withdraw tables) ----------
 
-app.get('/proxy/withdrawals', requireAuth, async (req, res) => {
-  try {
-    const rows = await all('SELECT w.*, m.name as member_name FROM withdrawals w LEFT JOIN members m ON m.id=w.member_id ORDER BY timestamp DESC LIMIT 2000');
-    res.json(rows);
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, message:e.message }); }
-});
+function monitorLoop() {
+  // check pending deposits and auto-complete (simulation)
+  db.all(`SELECT * FROM deposits WHERE status = 'pending' LIMIT 10`, [], (err, rows) => {
+    if (err) return console.error('monitor deposits err', err);
+    rows.forEach(dep => {
+      // example policy: if deposit exists longer than 10s -> mark done and credit
+      const age = Date.now() - (dep.created_at || 0);
+      if (age > 10 * 1000) {
+        // credit user
+        db.get(`SELECT * FROM members WHERE id = ?`, [dep.member_id], (e, mem) => {
+          if (!mem) {
+            // if member missing, mark deposit failed
+            db.run(`UPDATE deposits SET status = 'failed' WHERE id = ?`, [dep.id]);
+            notifyAdmin(`Deposit ${dep.id} failed: member ${dep.member_id} not found`);
+            return;
+          }
+          const newBal = (mem.balance || 0) + (dep.amount || 0);
+          db.run(`UPDATE members SET balance = ? WHERE id = ?`, [newBal, mem.id]);
+          db.run(`UPDATE deposits SET status = 'done' WHERE id = ?`, [dep.id]);
+          db.run(`INSERT INTO transactions (id, member_id, kind, amount, status, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [uuidv4(), mem.id, 'deposit', dep.amount || 0, 'done', `auto-credit deposit ${dep.id}`, Date.now()]);
+          marketPush && marketPush(`市场通知: 会员 ${mem.username} 收到充值 ${dep.amount}，新余额 ${newBal}`);
+        });
+      }
+    });
+  });
 
-app.get('/proxy/transactions', requireAuth, async (req, res) => {
-  try {
-    const d = await all('SELECT id, order_id, member_id, wallet, amount, currency, status, timestamp, "recharge" as type FROM deposits ORDER BY timestamp DESC LIMIT 2000');
-    const w = await all('SELECT id, order_id, member_id, wallet, amount, currency, status, timestamp, "withdraw" as type FROM withdrawals ORDER BY timestamp DESC LIMIT 2000');
-    const o = await all('SELECT id, order_id, user as member_id, NULL as wallet, amount, NULL as currency, status, timestamp, "order" as type FROM orders ORDER BY timestamp DESC LIMIT 2000');
-    const merged = [...d, ...w, ...o].sort((a,b)=> (new Date(b.timestamp||0) - new Date(a.timestamp||0)));
-    res.json(merged);
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, message:e.message }); }
-});
-
-// create deposit/withdraw (UI usage)
-app.post('/proxy/recharge', requireAuth, async (req, res) => {
-  try {
-    const p = req.body || {};
-    const orderId = 'R' + Date.now();
-    const ts = new Date().toISOString();
-    await run('INSERT INTO deposits (order_id, member_id, wallet, amount, currency, status, ip, timestamp, raw) VALUES (?,?,?,?,?,?,?,?,?)',
-      [orderId, p.member||null, p.wallet||null, Number(p.amount||0), p.currency||'BRL', p.status||'pending', req.ip, ts, JSON.stringify(p)]);
-    try{ await sendMarketPush(`💳 新充值: ${orderId} ${p.amount} ${p.currency}`); } catch(e){}
-    try{ await sendAdminNotify(`💳 新充值: ${orderId}\n金额: ${p.amount} ${p.currency}\n会员: ${p.member||'unknown'}\nIP: ${req.ip}`); } catch(e){}
-    res.json({ ok:true, orderId });
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, message: e.message }); }
-});
-
-app.post('/proxy/withdraw', requireAuth, async (req, res) => {
-  try {
-    const p = req.body || {};
-    const orderId = 'W' + Date.now();
-    const ts = new Date().toISOString();
-    await run('INSERT INTO withdrawals (order_id, member_id, wallet, amount, currency, status, ip, timestamp, raw) VALUES (?,?,?,?,?,?,?,?,?)',
-      [orderId, p.member||null, p.wallet||null, Number(p.amount||0), p.currency||'BRL', p.status||'pending', req.ip, ts, JSON.stringify(p)]);
-    try{ await sendAdminNotify(`🧾 新提款请求: ${orderId}\n金额: ${p.amount} ${p.currency}\n会员: ${p.member||'unknown'}`); } catch(e){}
-    res.json({ ok:true, orderId });
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, message: e.message }); }
-});
-
-// update deposit/withdraw status (super admin)
-app.post('/api/deposits/:id/status', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const id = Number(req.params.id), status = req.body.status;
-    await run('UPDATE deposits SET status=? WHERE id=?', [status, id]);
-    try{ await sendAdminNotify(`🔁 充值订单 ${id} 状态已改为 ${status} by ${req.session.user.username}`); }catch(e){}
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
-});
-app.post('/api/withdrawals/:id/status', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const id = Number(req.params.id), status = req.body.status;
-    await run('UPDATE withdrawals SET status=? WHERE id=?', [status, id]);
-    if (status && status.toString().toLowerCase()==='failed') {
-      try{ await sendAdminNotify(`❌ 提现失败: id=${id} by ${req.session.user.username}`); }catch(e){}
-    } else {
-      try{ await sendAdminNotify(`🔁 提现 ${id} 状态已改为 ${status} by ${req.session.user.username}`); }catch(e){}
-    }
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
-});
-
-// ---------- Amount adjust endpoints (super admin) ----------
-app.post('/api/deposits/:id/adjust', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { amount, reason } = req.body || {};
-    if (amount === undefined) return res.status(400).json({ ok:false, message:'缺少 amount' });
-    await run('UPDATE deposits SET amount=? WHERE id=?', [Number(amount), id]);
-    await run('INSERT INTO orders (order_id, user, amount, status, timestamp, raw) VALUES (?,?,?,?,?,?)',
-      [`ADJ-D-${id}-${Date.now()}`, req.session.user.username, Number(amount), 'adjust', new Date().toISOString(), JSON.stringify({reason})]);
-    try{ await sendAdminNotify(`🔧 充值调整 id:${id} amount:${amount} by ${req.session.user.username}`); }catch(e){}
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
-});
-
-app.post('/api/withdrawals/:id/adjust', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { amount, reason } = req.body || {};
-    if (amount === undefined) return res.status(400).json({ ok:false, message:'缺少 amount' });
-    await run('UPDATE withdrawals SET amount=? WHERE id=?', [Number(amount), id]);
-    await run('INSERT INTO orders (order_id, user, amount, status, timestamp, raw) VALUES (?,?,?,?,?,?)',
-      [`ADJ-W-${id}-${Date.now()}`, req.session.user.username, Number(amount), 'adjust', new Date().toISOString(), JSON.stringify({reason})]);
-    try{ await sendAdminNotify(`🔧 提现调整 id:${id} amount:${amount} by ${req.session.user.username}`); }catch(e){}
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
-});
-
-// ---------- Settings ----------
-app.get('/api/settings/get', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const rows = await all('SELECT k,v FROM settings');
-    const out = {};
-    rows.forEach(r => { try{ out[r.k] = JSON.parse(r.v); }catch(e){ out[r.k]=r.v; }});
-    res.json({ ok:true, settings: out });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
-});
-
-app.post('/api/settings/update', requireAuth, requireSuper, async (req, res) => {
-  try {
-    const body = req.body || {};
-    for (const k of Object.keys(body)) {
-      await run('INSERT OR REPLACE INTO settings (k,v) VALUES (?,?)', [k, JSON.stringify(body[k])]);
-    }
-    res.json({ ok:true });
-  } catch (e) { res.status(500).json({ ok:false, message:e.message }); }
-});
-
-// ---------- 2FA placeholders ----------
-app.get('/api/2fa/setup', requireAuth, async (req, res) => {
-  // For demo: generate simple secret and enable (in prod use real TOTP)
-  const secret = uuidv4().slice(0,8);
-  await run('UPDATE users SET twofa_secret=?, twofa_enabled=1 WHERE id=?', [secret, req.session.user.id]);
-  try{ await sendAdminNotify(`🔐 2FA 已启用 for ${req.session.user.username}`); }catch(e){}
-  res.json({ ok:true, secret, qr: `2FA-SECRET:${secret}` });
-});
-app.post('/api/2fa/disable', requireAuth, async (req, res) => {
-  await run('UPDATE users SET twofa_secret=NULL, twofa_enabled=0 WHERE id=?', [req.session.user.id]);
-  try{ await sendAdminNotify(`🔐 2FA 已禁用 for ${req.session.user.username}`); }catch(e){}
-  res.json({ ok:true });
-});
-
-// ---------- System alerts endpoint ----------
-app.post('/api/alert', requireAuth, requireSuper, async (req, res) => {
-  const { text } = req.body || {};
-  if (!text) return res.status(400).json({ ok:false });
-  try { await sendAdminNotify(`⚠️ 系统警报:\n${text}`); } catch(e){}
-  res.json({ ok:true });
-});
-
-// ---------- Fallback ----------
-app.use((req, res) => {
-  if (req.path.startsWith('/api') || req.path.startsWith('/proxy')) return res.status(404).json({ ok:false, message: 'not found' });
-  return res.status(404).send('Not Found');
-});
-
-// ---------- Monitor: frequent deposits alert ----------
-const MONITOR_INTERVAL_SEC = 20; // how often to check in seconds
-async function monitorFrequentDeposits() {
-  try {
-    const rows = await all('SELECT k,v FROM settings');
-    const S = {};
-    rows.forEach(r => { try{ S[r.k]=JSON.parse(r.v);}catch(e){ S[r.k]=r.v;} });
-    const threshold = (S.tgThresholdCount) || 5;
-    const windowSec = (S.tgWindowSeconds) || 3600;
-    const since = new Date(Date.now() - windowSec*1000).toISOString();
-    const recent = await all('SELECT COUNT(*) as c FROM deposits WHERE timestamp >= ?', [since]);
-    const c = (recent && recent[0] && recent[0].c) ? recent[0].c : 0;
-    if (c >= threshold) {
-      await sendAdminNotify(`🚨 监测到短时充值异常: ${c} 笔，阈值 ${threshold}，窗口 ${windowSec}s`);
-    }
-    // also scan failed withdrawals and notify
-    const failed = await all('SELECT id,order_id,member_id,amount,timestamp FROM withdrawals WHERE status="failed" AND timestamp >= ?', [since]);
-    if (failed && failed.length>0) {
-      await sendAdminNotify(`❌ 检测到 ${failed.length} 条近期提现失败记录`);
-    }
-  } catch (e) { console.warn('monitor error', e && e.message); }
+  // check withdrawals with status 'processing' -> if stuck, mark failed and notify
+  db.all(`SELECT * FROM withdrawals WHERE status = 'processing' LIMIT 20`, [], (err, rows) => {
+    if (err) return console.error('monitor withdrawals err', err);
+    rows.forEach(w => {
+      const age = Date.now() - (w.created_at || 0);
+      // if processing over threshold (e.g., 60s) -> mark failed and notify
+      if (age > 60 * 1000) {
+        db.run(`UPDATE withdrawals SET status = 'failed' WHERE id = ?`, [w.id]);
+        notifyAdmin(`提款 ${w.id} 处理超时，已标记为 FAILED（可能无法提款）`);
+      }
+    });
+  });
 }
-setInterval(monitorFrequentDeposits, MONITOR_INTERVAL_SEC*1000);
 
-// ---------- Start server ----------
+// start monitor every 10s
+setInterval(monitorLoop, 10 * 1000);
+
+// ---------- Basic logging helper ----------
+function appLog(level, message, meta) {
+  const id = uuidv4();
+  db.run(`INSERT INTO logs (id, level, message, meta, created_at) VALUES (?, ?, ?, ?, ?)`,
+    [id, level, message, JSON.stringify(meta || {}), Date.now()]);
+  console.log(`[${level}] ${message}`);
+}
+
+// ---------- start server ----------
 app.listen(PORT, () => {
   console.log(`NexbitService (full) running at http://localhost:${PORT}`);
-  if (adminBot) console.log('Telegram admin bot configured');
-  if (marketBot) console.log('Telegram market bot configured');
+  // startup messages
+  if (adminBot) {
+    notifyAdmin('管理员机器人已配置并启动（后台通知）');
+  } else {
+    console.warn('管理员机器人未配置 (ADMIN_BOT_TOKEN)');
+  }
+  if (marketBot) {
+    marketPush('市场推送机器人已准备就绪');
+  } else {
+    console.warn('市场推送机器人未配置 (BOT_TOKEN)');
+  }
+  appLog('info', 'Server started', { port: PORT });
 });
