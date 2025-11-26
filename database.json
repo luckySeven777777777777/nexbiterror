@@ -1,0 +1,15 @@
+{
+  "admins": [
+    {
+      "id": "6062973135",
+      "username": "root",
+      "password": "123456"
+    }
+  ],
+  "users": [],
+  "transactions": [],
+  "settings": {
+    "brandName": "Nexbit",
+    "announcement": ""
+  }
+}
